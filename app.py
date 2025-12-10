@@ -1,155 +1,183 @@
-import streamlit as st
+import io
+import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
+from dateutil.parser import parse as parse_date
+import streamlit as st
 
-# --- Configuración de la página ---
-st.set_page_config(page_title="Predicción de salida de hornos", page_icon="🔥", layout="centered")
-st.title("🔥 Predicción de salida de hornos")
+# ==============================
+# CONFIGURACIÓN
+# ==============================
 
-# --- Paso 1: Ingreso de tiempos de cocción ---
-st.markdown("### Paso 1️⃣ — Ingresar tiempos de cocción (en horas)")
+URL_LOGIN = "https://web-sl.repman.co/v2/acceso/login"
+URL_REPORTE = "https://repman.co/sl2/reportes/salidaHornoTurnos"  # si falla, se podría probar el host web-sl
+CSV_SEP = ";"
 
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    horno1 = st.number_input("Horno 1 (h)", min_value=0.0, step=0.1)
-with col2:
-    horno2 = st.number_input("Horno 2 (h)", min_value=0.0, step=0.1)
-with col3:
-    horno3 = st.number_input("Horno 3 (h)", min_value=0.0, step=0.1)
-with col4:
-    horno4 = st.number_input("Horno 4 (h)", min_value=0.0, step=0.1)
 
-horno_tiempos = {1: horno1, 2: horno2, 3: horno3, 4: horno4}
+# ==============================
+# FUNCIONES
+# ==============================
 
-st.write(f"**Tiempos ingresados:** H1 = {horno1} h | H2 = {horno2} h | H3 = {horno3} h | H4 = {horno4} h")
+def iniciar_sesion(codigo: str, contrasena: str) -> requests.Session:
+    """Login en repman con usuario / contraseña / centro CC06."""
+    ses = requests.Session()
 
-if any(v == 0 for v in horno_tiempos.values()):
-    st.warning("⚠️ Ingresa todos los tiempos de cocción antes de continuar.")
-    st.stop()
+    payload = {
+        "usuario": codigo,
+        "contrasena": contrasena,
+        "centro": "CC06",
+    }
 
-# --- Paso 2: Selección de turno ---
-st.markdown("### Paso 2️⃣ — Selecciona el turno a analizar")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+    }
 
-turno = st.selectbox(
-    "Selecciona el turno:",
-    ["6:00 a.m. – 2:00 p.m.", "2:00 p.m. – 10:00 p.m.", "10:00 p.m. – 6:00 a.m."]
+    resp = ses.post(URL_LOGIN, json=payload, headers=headers)
+
+    if resp.status_code != 200:
+        raise Exception(
+            f"Error al hacer login. HTTP {resp.status_code}\n"
+            f"Respuesta: {resp.text[:300]}"
+        )
+
+    return ses
+
+
+def descargar_csv(ses: requests.Session) -> pd.DataFrame:
+    """Descarga el CSV de salida de horno con la sesión autenticada y lo devuelve como DataFrame."""
+    resp = ses.get(URL_REPORTE)
+
+    if resp.status_code != 200:
+        raise Exception(
+            f"Error al descargar archivo. HTTP {resp.status_code}\n"
+            f"Respuesta: {resp.text[:300]}"
+        )
+
+    # Leemos directamente desde memoria
+    df = pd.read_csv(io.BytesIO(resp.content), sep=CSV_SEP)
+
+    # Limpieza básica de tipos
+    if "fecha" in df.columns:
+        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    if "turno" in df.columns:
+        df["turno"] = pd.to_numeric(df["turno"], errors="coerce").astype("Int64")
+
+    if "cantidad" in df.columns:
+        df["cantidad"] = pd.to_numeric(df["cantidad"], errors="coerce").astype("Int64")
+
+    return df
+
+
+def aplicar_filtros(
+    df: pd.DataFrame,
+    fecha_desde,
+    fecha_hasta,
+    turno,
+    linea,
+    codigo_sap,
+) -> pd.DataFrame:
+
+    df_fil = df.copy()
+
+    if fecha_desde is not None:
+        df_fil = df_fil[df_fil["fecha"] >= fecha_desde]
+
+    if fecha_hasta is not None:
+        df_fil = df_fil[df_fil["fecha"] <= fecha_hasta]
+
+    if turno is not None and turno != "Todos":
+        df_fil = df_fil[df_fil["turno"] == int(turno)]
+
+    if linea:
+        df_fil = df_fil[df_fil["linea"] == linea]
+
+    if codigo_sap:
+        df_fil = df_fil[df_fil["codigoSAP"] == codigo_sap]
+
+    return df_fil
+
+
+# ==============================
+# APP STREAMLIT
+# ==============================
+
+st.set_page_config(page_title="Salida de Horno", layout="wide")
+
+st.title("📦 Salida de Horno - Descarga y Filtro")
+
+st.markdown(
+    "Aplicación para descargar el reporte de **Salida de Horno por Turnos**, "
+    "filtrarlo y exportar los resultados."
 )
 
-if turno == "6:00 a.m. – 2:00 p.m.":
-    hora_inicio, hora_fin = "06:00", "14:00"
-elif turno == "10:00 p.m. – 6:00 a.m.":
-    hora_inicio, hora_fin = "22:00", "06:00"
-else:
-    hora_inicio, hora_fin = "14:00", "22:00"
+with st.form("login_y_filtros"):
+    st.subheader("1️⃣ Credenciales de acceso")
 
-st.info(f"Analizando piezas que saldrán entre **{hora_inicio}** y **{hora_fin}**.")
+    codigo = st.text_input("Código (usuario)", value="", max_chars=10)
+    contrasena = st.text_input("Contraseña", type="password", value="")
 
-# --- Paso 3: Cargar archivo ---
-st.markdown("### Paso 3️⃣ — Cargar archivo de producción (.csv o .xlsx)")
-archivo = st.file_uploader("Selecciona tu archivo", type=["csv", "xlsx", "xls"])
+    st.caption("El centro se usa fijo como **CC06** dentro de la app.")
 
-if archivo is not None:
-    try:
-        if archivo.name.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(archivo)
-        else:
-            try:
-                df = pd.read_csv(archivo, sep=";")
-            except Exception:
-                archivo.seek(0)
-                df = pd.read_csv(archivo, sep=",")
-        df.columns = df.columns.str.strip()
-    except Exception as e:
-        st.error(f"❌ Error al leer el archivo: {e}")
-        df = None
-else:
-    df = None
+    st.subheader("2️⃣ Filtros del reporte")
 
-if df is not None:
-    st.success(f"✅ Archivo cargado correctamente ({df.shape[0]} filas × {df.shape[1]} columnas)")
-    st.dataframe(df.head(), use_container_width=True)
+    col1, col2 = st.columns(2)
 
-    columnas_necesarias = {"fechaCaptura", "hora", "horno", "cantidad", "material"}
-    if not columnas_necesarias.issubset(df.columns):
-        st.error(f"⚠️ El archivo debe contener las columnas: {', '.join(columnas_necesarias)}")
-        st.stop()
+    with col1:
+        fecha_desde = st.date_input("Fecha desde", value=None)
+    with col2:
+        fecha_hasta = st.date_input("Fecha hasta", value=None)
 
-    # --- Normalización del número de horno ---
-    df["horno"] = df["horno"].astype(str).str.extract(r"(\d+)").astype(float)
+    turno = st.selectbox("Turno", options=["Todos", "1", "2", "3"])
+    linea = st.text_input("Línea (ej: 'LV&PD', 'TQ', 'TZ AA')", value="")
+    codigo_sap = st.text_input("Código SAP (ej: 'O14191035')", value="")
 
-    # --- Conversión robusta de fecha y hora ---
-    def parse_hora(h):
-        try:
-            return datetime.strptime(str(h).strip(), "%H:%M").time()
-        except:
-            try:
-                return datetime.strptime(str(h).strip(), "%H:%M:%S").time()
-            except:
-                return pd.NaT
+    ejecutar = st.form_submit_button("🔄 Descargar y filtrar")
 
-    try:
-        df["fechaCaptura"] = pd.to_datetime(df["fechaCaptura"].astype(str), errors="coerce")
-        df["hora"] = df["hora"].apply(parse_hora)
-    except Exception as e:
-        st.error(f"❌ Error al convertir columnas de fecha u hora: {e}")
-        st.stop()
-
-    # --- Eliminar filas con formato inválido ---
-    if df["fechaCaptura"].isna().any() or df["hora"].isna().any():
-        st.warning("⚠️ Algunas filas tienen formato de fecha u hora no reconocido y serán omitidas.")
-        df = df.dropna(subset=["fechaCaptura", "hora"])
-
-    # --- Cálculo de hora de salida ---
-    df["fechaHoraEntrada"] = [
-        datetime.combine(fecha, hora) for fecha, hora in zip(df["fechaCaptura"], df["hora"])
-    ]
-
-    def calcular_salida(row):
-        horno = int(row["horno"]) if not pd.isna(row["horno"]) else None
-        tiempo_horno = horno_tiempos.get(horno, 0)
-        return row["fechaHoraEntrada"] + timedelta(hours=tiempo_horno)
-
-    with st.spinner("⏳ Calculando predicciones..."):
-        df["fechaHoraSalida"] = df.apply(calcular_salida, axis=1)
-
-        # --- Determinar rango horario ---
-        def rango(fecha):
-            inicio = datetime.combine(fecha, datetime.strptime(hora_inicio, "%H:%M").time())
-            fin = datetime.combine(fecha, datetime.strptime(hora_fin, "%H:%M").time())
-            # Si el rango pasa a la madrugada (p.ej. 22:00 – 06:00)
-            if fin < inicio:
-                fin += timedelta(days=1)
-            return inicio, fin
-
-        df["en_rango"] = df.apply(
-            lambda x: rango(x["fechaCaptura"])[0] <= x["fechaHoraSalida"] <= rango(x["fechaCaptura"])[1],
-            axis=1
-        )
-
-        df_salida = df[df["en_rango"]].copy()
-
-    # --- Resultados ---
-    if df_salida.empty:
-        st.warning("⚠️ Ninguna producción tiene hora de salida dentro del turno seleccionado.")
+if ejecutar:
+    if not codigo or not contrasena:
+        st.error("Por favor ingresa tu código y contraseña.")
     else:
-        resumen = df_salida.groupby("material", as_index=False)["cantidad"].sum()
-        resumen = resumen.rename(columns={"cantidad": f"Cantidad estimada ({hora_inicio}–{hora_fin})"})
+        try:
+            with st.spinner("Iniciando sesión..."):
+                ses = iniciar_sesion(codigo, contrasena)
 
-        total_piezas = resumen.iloc[:, 1].sum()
+            with st.spinner("Descargando y leyendo CSV..."):
+                df = descargar_csv(ses)
 
-        st.success("✅ Resultados de predicción")
-        st.metric("Piezas estimadas", f"{total_piezas:,.0f}")
-        st.dataframe(resumen, use_container_width=True)
+            # Convertimos fechas de date_input a datetime
+            f_desde_dt = datetime.combine(fecha_desde, datetime.min.time()) if fecha_desde else None
+            f_hasta_dt = datetime.combine(fecha_hasta, datetime.max.time()) if fecha_hasta else None
 
-        st.markdown("#### Detalle de lotes con hora de salida estimada:")
-        st.dataframe(df_salida[["material", "horno", "cantidad", "fechaHoraSalida"]], use_container_width=True)
+            df_filtrado = aplicar_filtros(
+                df,
+                fecha_desde=f_desde_dt,
+                fecha_hasta=f_hasta_dt,
+                turno=turno,
+                linea=linea.strip() or None,
+                codigo_sap=codigo_sap.strip() or None,
+            )
 
-        # --- Botón de descarga ---
-        st.download_button(
-            "⬇️ Descargar resultados en CSV",
-            resumen.to_csv(index=False).encode("utf-8"),
-            file_name="prediccion_salida_hornos.csv",
-            mime="text/csv"
-        )
-else:
-    st.info("📂 Sube un archivo CSV o Excel para comenzar.")
+            st.success(f"Registros totales: {len(df)} | Después de filtrar: {len(df_filtrado)}")
+
+            if len(df_filtrado) == 0:
+                st.warning("No hay datos con esos criterios.")
+            else:
+                st.subheader("📄 Tabla filtrada")
+                st.dataframe(df_filtrado, use_container_width=True)
+
+                # CSV para descargar
+                csv_buffer = io.StringIO()
+                df_filtrado.to_csv(csv_buffer, sep=CSV_SEP, index=False)
+                csv_bytes = csv_buffer.getvalue().encode("utf-8")
+
+                st.download_button(
+                    label="⬇️ Descargar CSV filtrado",
+                    data=csv_bytes,
+                    file_name="salida_horno_turnos_filtrado.csv",
+                    mime="text/csv",
+                )
+
+        except Exception as e:
+            st.error(f"Ocurrió un error: {e}")
