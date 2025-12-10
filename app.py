@@ -23,8 +23,8 @@ def iniciar_sesion(codigo: str, contrasena: str) -> requests.Session:
     ses = requests.Session()
 
     payload = {
-        "usuario": F011,
-        "contrasena": 12345,
+        "usuario": codigo,
+        "contrasena": contrasena,
         "centro": "CC06",
     }
 
